@@ -10,6 +10,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError } from '../core/operations.ts';
 import type { Operation, OperationContext } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
+import { maybeRenderUi } from './ui-middleware.ts';
 
 export interface ToolResult {
   content: { type: 'text'; text: string }[];
@@ -196,7 +197,23 @@ export async function dispatchToolCall(
 
   try {
     const result = await op.handler(ctx, safeParams);
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+
+    // GenUI hook (optional). Never let UI failure fail the MCP response.
+    let ui = null;
+    try {
+      ui = await maybeRenderUi({
+        operation: op.name,
+        params: safeParams,
+        result,
+        ctx,
+      });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      ctx.logger?.warn?.(`GenUI failed: ${msg}`);
+    }
+
+    const payload = ui ? { result, ui } : result;
+    return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
   } catch (e: unknown) {
     if (e instanceof OperationError) {
       return { content: [{ type: 'text', text: JSON.stringify(e.toJSON(), null, 2) }], isError: true };
