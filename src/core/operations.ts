@@ -1734,6 +1734,109 @@ const send_job_message: Operation = {
   },
 };
 
+// --- GenUI render ops ---
+
+/**
+ * `render_chart` is the explicit "I have data, give me a chart URL" tool.
+ * The agent feeds in an x/y series it has assembled (e.g. from a web search
+ * via Tavily/Exa) and the GenUI middleware in `src/mcp/ui-middleware.ts`
+ * folds it into a `line_chart` artifact and POSTs it to the Hermes portal.
+ *
+ * The handler here is intentionally thin: it validates the shape and returns
+ * the payload marked with `_genui_template: 'line_chart'`. Everything else
+ * (catalog check, payload shaping, artifact POST, fallback if the portal
+ * isn't ready) lives in the middleware. When `GENUI_LINE_CHART` is unset on
+ * the Hermes Railway env, the middleware's catalog gate skips the artifact
+ * cleanly with `reasons: ['template_not_in_catalog']` and the agent gets
+ * the bare data back — no broken UI, no portal 400.
+ */
+const render_chart: Operation = {
+  name: 'render_chart',
+  description:
+    'Render a UI line chart from data the agent has assembled. Returns the structured chart payload; the GenUI middleware POSTs it to the portal and folds the artifact URL into the response\'s `ui` field. Use this when the user explicitly asks for a chart OR when a numeric time-series result deserves visualization (stock prices, metrics over time, etc.). The agent provides x/y points; do NOT call this for free-text or non-numeric data.',
+  params: {
+    title: {
+      type: 'string',
+      required: true,
+      description: 'Chart title (e.g. "AAPL closing price, last 12 months")',
+    },
+    x_label: {
+      type: 'string',
+      required: true,
+      description: 'X-axis label (e.g. "Date")',
+    },
+    y_label: {
+      type: 'string',
+      required: true,
+      description: 'Y-axis label (e.g. "Closing price")',
+    },
+    series: {
+      type: 'array',
+      required: true,
+      description:
+        'One or more series, each {name: string, points: [{x, y}, ...]}. y must be a finite number; x can be a string (date) or number. Pass multiple series for an overlay chart.',
+    },
+    y_format: {
+      type: 'string',
+      enum: ['number', 'currency', 'percent'],
+      description: 'Optional Y-axis formatter hint. Defaults to "number".',
+    },
+    source_url: {
+      type: 'string',
+      description: 'Optional source URL the data came from (web search citation).',
+    },
+  },
+  scope: 'read',
+  handler: async (_ctx, p) => {
+    const series = p.series as unknown[];
+    if (!Array.isArray(series) || series.length === 0) {
+      throw new OperationError('invalid_params', '`series` must be a non-empty array');
+    }
+    const validatedSeries = series.map((s, i) => {
+      if (!s || typeof s !== 'object' || Array.isArray(s)) {
+        throw new OperationError('invalid_params', `series[${i}] must be an object`);
+      }
+      const sObj = s as Record<string, unknown>;
+      if (typeof sObj.name !== 'string' || sObj.name.length === 0) {
+        throw new OperationError('invalid_params', `series[${i}].name must be a non-empty string`);
+      }
+      if (!Array.isArray(sObj.points) || sObj.points.length === 0) {
+        throw new OperationError('invalid_params', `series[${i}].points must be a non-empty array`);
+      }
+      const validatedPoints = sObj.points.map((pt, j) => {
+        if (!pt || typeof pt !== 'object' || Array.isArray(pt)) {
+          throw new OperationError('invalid_params', `series[${i}].points[${j}] must be an object`);
+        }
+        const ptObj = pt as Record<string, unknown>;
+        if (typeof ptObj.y !== 'number' || !Number.isFinite(ptObj.y)) {
+          throw new OperationError('invalid_params', `series[${i}].points[${j}].y must be a finite number`);
+        }
+        return { x: ptObj.x ?? null, y: ptObj.y };
+      });
+      return { name: sObj.name, points: validatedPoints };
+    });
+
+    const yFormat = ((p.y_format as string) || 'number') as 'number' | 'currency' | 'percent';
+    if (!['number', 'currency', 'percent'].includes(yFormat)) {
+      throw new OperationError('invalid_params', '`y_format` must be one of: number | currency | percent');
+    }
+
+    return {
+      // Marker the GenUI middleware looks for; let it know the result is
+      // already in chart-payload shape and shouldn't be reshaped.
+      _genui_template: 'line_chart',
+      title: p.title,
+      x_axis: { label: p.x_label, field: 'x' },
+      y_axis: { label: p.y_label, field: 'y', format: yFormat },
+      series: validatedSeries,
+      ...(typeof p.source_url === 'string' && p.source_url.length > 0
+        ? { source_url: p.source_url }
+        : {}),
+    };
+  },
+  cliHints: { name: 'render-chart', hidden: true },
+};
+
 // --- Orphans ---
 
 const find_orphans: Operation = {
@@ -1988,6 +2091,8 @@ export const operations: Operation[] = [
   pause_job, resume_job, replay_job, send_job_message,
   // Orphans
   find_orphans,
+  // GenUI render ops
+  render_chart,
   // v0.28: Takes + think
   takes_list, takes_search, think,
   // v0.28: whoami + scoped sources management

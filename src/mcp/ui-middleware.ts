@@ -122,6 +122,7 @@ export function logGenuiBoot(): void {
     timeout_ms: cfg.timeoutMs,
     view_picker_enabled: cfg.viewPickerEnabled,
     view_picker_model: cfg.viewPickerModel ?? '<gateway-default>',
+    line_chart_enabled: cfg.lineChartEnabled,
     debug_log_path: resolveDebugLogPath(),
   });
 }
@@ -170,6 +171,13 @@ export interface GenuiConfig {
   viewPickerModel: string | null;
   /** Total view-picker call timeout (ms). Tight cap so renders stay snappy. */
   viewPickerTimeoutMs: number;
+  /**
+   * Per-template feature flag. When true, `line_chart` is added to
+   * TEMPLATE_CATALOG so the LLM picker may emit it AND the `render_chart`
+   * MCP op routes through it. Off by default — flip on once the Hermes
+   * portal renderer is ready (otherwise every line_chart artifact 400s).
+   */
+  lineChartEnabled: boolean;
 }
 
 export interface UiArtifactSummary {
@@ -220,6 +228,11 @@ export const UI_RULES: Record<string, UiRule> = {
   find_orphans:   { renderable: true,          category: 'graph',    defaultView: 'cards',     template: 'generic_cards' },
   get_backlinks:  { renderable: 'conditional', category: 'graph',    defaultView: 'cards',     template: 'generic_cards' },
   list_pages:     { renderable: 'conditional', category: 'search',   defaultView: 'table',     template: 'search_table' },
+  // Explicit-render op: agent assembles {x, y} points (e.g. from web search
+  // via Tavily/Exa or from an MCP that returns financial data) and calls
+  // render_chart to produce a portal artifact URL. Skipped automatically by
+  // decideRender's catalog check until GENUI_LINE_CHART=true on Hermes.
+  render_chart:   { renderable: true,          category: 'finance',  defaultView: 'chart',     template: 'line_chart' },
 };
 
 // --- Config (read at call time) ---
@@ -261,9 +274,11 @@ export function loadGenuiConfig(): GenuiConfig {
   const viewPickerEnabled = parseBool(env.GENUI_VIEW_PICKER, false);
   const viewPickerModel = env.GENUI_VIEW_PICKER_MODEL?.trim() || null;
   const viewPickerTimeoutMs = parseInt10(env.GENUI_VIEW_PICKER_TIMEOUT_MS, 3000);
+  const lineChartEnabled = parseBool(env.GENUI_LINE_CHART, false);
   return {
     enabled, mode, baseUrl, apiToken: apiToken || null, ttlHours, renderFor,
     maxPayloadBytes, timeoutMs, viewPickerEnabled, viewPickerModel, viewPickerTimeoutMs,
+    lineChartEnabled,
   };
 }
 
@@ -565,6 +580,14 @@ export function decideRender(
     reasons.push('category_disabled');
     return empty(reasons, override);
   }
+  // Reject early if the rule's template isn't in the effective catalog.
+  // Stops a UI rule with `template: "line_chart"` from POSTing artifacts
+  // before the portal-side renderer is enabled, which would 400 every time.
+  const activeCatalog = getTemplateCatalog(cfg);
+  if (!activeCatalog.some(t => t.template === rule.template)) {
+    reasons.push('template_not_in_catalog');
+    return empty(reasons, override);
+  }
 
   // 6. Payload size limit.
   const approxBytes = approxResultBytes(result);
@@ -815,6 +838,66 @@ function shapeGenericCards(_params: Record<string, unknown>, result: unknown): R
   return { cards: [] };
 }
 
+/**
+ * Build a `line_chart` payload from any of three input shapes:
+ *   1. The `render_chart` op handler return (already chart-shaped, marked
+ *      with `_genui_template: "line_chart"`).
+ *   2. A markdown 2-column numeric table (e.g. extracted from a search hit
+ *      where col1 is a year and col2 is a price).
+ *   3. An array of `{x, y}` point objects.
+ * Returns null if none of those shapes match — caller decides what to do
+ * with that, which today means fall back to whatever else fits.
+ */
+export function shapeLineChart(
+  params: Record<string, unknown>,
+  result: unknown,
+): Record<string, unknown> | null {
+  // Case 1: handler already produced a chart payload.
+  if (isPlainObject(result) && result._genui_template === 'line_chart') {
+    const { _genui_template: _t, ...rest } = result as Record<string, unknown>;
+    return rest;
+  }
+
+  // Case 2: caller passed raw {title, x_label, y_label, series}.
+  if (isPlainObject(result) && Array.isArray((result as Record<string, unknown>).series)) {
+    return result as Record<string, unknown>;
+  }
+
+  // Case 3: top-of-search-results with a markdown table in chunk_text.
+  if (Array.isArray(result) && result.length === 1 && isPlainObject(result[0])) {
+    const top = result[0] as Record<string, unknown>;
+    const text = typeof top.chunk_text === 'string' ? top.chunk_text : '';
+    const md = parseMarkdownTable(text);
+    if (md && md.columns.length === 2 && md.rows.length >= 2) {
+      const xKey = md.columns[0];
+      const yKey = md.columns[1];
+      // Y must be numeric in every row; otherwise this isn't a chartable series.
+      const allNumericY = md.rows.every(r => typeof r[yKey] === 'number');
+      if (allNumericY) {
+        return {
+          title: md.title || (typeof top.title === 'string' ? top.title : ''),
+          x_axis: { label: xKey, field: 'x' },
+          y_axis: { label: yKey, field: 'y', format: detectYFormat(text) },
+          series: [{
+            name: yKey,
+            points: md.rows.map(r => ({ x: r[xKey], y: r[yKey] })),
+          }],
+          source_slug: typeof top.slug === 'string' ? top.slug : null,
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function detectYFormat(text: string): 'currency' | 'percent' | 'number' {
+  // Quick heuristic — currency wins if $ shows up at all in the source markdown.
+  if (/\$\d/.test(text)) return 'currency';
+  if (/\d%(?!\d)/.test(text)) return 'percent';
+  return 'number';
+}
+
 export function shapePortalPayload(template: string, params: Record<string, unknown>, result: unknown): unknown {
   switch (template) {
     case 'search_table':    return shapeSearchTable(params, result);
@@ -822,6 +905,12 @@ export function shapePortalPayload(template: string, params: Record<string, unkn
     case 'jobs_status':     return shapeJobsStatus(params, result);
     case 'stats_dashboard': return shapeStatsDashboard(params, result);
     case 'generic_cards':   return shapeGenericCards(params, result);
+    case 'line_chart': {
+      const shaped = shapeLineChart(params, result);
+      // Fall back to raw result on shape miss so the portal sees what GBrain
+      // sent and the response_body in the artifact_post log explains why.
+      return shaped ?? result;
+    }
     default:                return result;
   }
 }
@@ -847,13 +936,10 @@ export interface TemplateCatalogEntry {
 }
 
 /**
- * Catalog of templates the Hermes portal can render. Keep in sync with the
- * portal's template registry; sending a template name not in this list will
- * be 400'd by the portal.
- *
- * Future templates expected on the Hermes side (line_chart, bar_chart,
- * markdown_view, metric_card) get added here once the portal renders them —
- * the picker will start emitting them as soon as the catalog grows.
+ * Always-available templates the Hermes portal renders today. New templates
+ * added to the portal go through `OPTIONAL_TEMPLATES` below + an env flag,
+ * so adding a name here without the portal renderer doesn't immediately
+ * break by routing artifacts through a template that 400s.
  */
 export const TEMPLATE_CATALOG: TemplateCatalogEntry[] = [
   {
@@ -888,7 +974,44 @@ export const TEMPLATE_CATALOG: TemplateCatalogEntry[] = [
   },
 ];
 
-const TEMPLATE_BY_NAME = new Map(TEMPLATE_CATALOG.map(t => [t.template, t]));
+/**
+ * Optional templates that ship behind a feature flag because their portal
+ * renderer is added separately in the daniel-hermes repo. Until the flag is
+ * flipped, neither the rule-based picker nor the LLM picker will route
+ * artifacts to these templates — preventing the "we promoted but Hermes
+ * doesn't render it yet → 400 cascade" failure mode.
+ */
+interface OptionalTemplate extends TemplateCatalogEntry {
+  /** Returns true when the portal-side renderer is known to be live. */
+  isEnabled: (cfg: GenuiConfig) => boolean;
+}
+
+const OPTIONAL_TEMPLATES: OptionalTemplate[] = [
+  {
+    template: 'line_chart',
+    category: 'finance',
+    view: 'chart',
+    description: 'X/Y line chart for numeric time series. Use when data has a sequential x-axis (years/dates) and a numeric y-axis. Y values must be numbers; format hint via y_axis.format = "currency" | "percent" | "number".',
+    isEnabled: (cfg) => cfg.lineChartEnabled,
+  },
+];
+
+/**
+ * Effective catalog the picker can choose from. Always includes the base
+ * 5 templates; additionally includes any optional templates whose flag is
+ * on. Read at call time so a Railway env flip takes effect without rebuild.
+ */
+export function getTemplateCatalog(cfg?: GenuiConfig): TemplateCatalogEntry[] {
+  const c = cfg ?? loadGenuiConfig();
+  const out: TemplateCatalogEntry[] = [...TEMPLATE_CATALOG];
+  for (const opt of OPTIONAL_TEMPLATES) {
+    if (opt.isEnabled(c)) {
+      const { isEnabled: _ie, ...entry } = opt;
+      out.push(entry);
+    }
+  }
+  return out;
+}
 
 /** Truncate the result to a small JSON sample fit for an LLM prompt. */
 function sampleResultForPrompt(result: unknown, maxBytes = 2000): unknown {
@@ -962,12 +1085,14 @@ async function pickViewWithLlm(opts: {
       recordDebug('view_picker', { skipped: true, reason: 'chat_not_available' });
       return null;
     }
+    const catalog = getTemplateCatalog(opts.cfg);
+    const byName = new Map(catalog.map(t => [t.template, t]));
     const sample = sampleResultForPrompt(opts.result);
     const prompt = JSON.stringify({
       operation: opts.operation,
       params: redactParamsSummary(opts.operation, opts.params),
       result_sample: sample,
-      candidate_templates: TEMPLATE_CATALOG.map(t => ({
+      candidate_templates: catalog.map(t => ({
         template: t.template,
         description: t.description,
       })),
@@ -997,7 +1122,7 @@ async function pickViewWithLlm(opts: {
       return null;
     }
     const tpl = typeof parsed.template === 'string' ? parsed.template : '';
-    const meta = TEMPLATE_BY_NAME.get(tpl);
+    const meta = byName.get(tpl);
     if (!meta) {
       recordDebug('view_picker', { skipped: true, reason: 'unknown_template', got: tpl, latency_ms: Date.now() - startedAt });
       return null;

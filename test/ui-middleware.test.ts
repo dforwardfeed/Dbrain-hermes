@@ -27,7 +27,9 @@ import {
   maybeRenderUi,
   normalizeOperationName,
   shapePortalPayload,
+  shapeLineChart,
   parseMarkdownTable,
+  getTemplateCatalog,
   TEMPLATE_CATALOG,
   UI_RULES,
   type ArtifactClient,
@@ -668,6 +670,127 @@ describe('TEMPLATE_CATALOG', () => {
       expect(typeof e.view).toBe('string');
       expect(e.description.length).toBeGreaterThan(10);
     }
+  });
+});
+
+// --- line_chart: catalog gating, shaper, and decideRender skip ---
+
+describe('line_chart feature flag', () => {
+  test('GENUI_LINE_CHART=false → catalog excludes line_chart', async () => {
+    await withEnv({ GENUI_ENABLED: 'true', GENUI_LINE_CHART: 'false' }, () => {
+      const cat = getTemplateCatalog();
+      expect(cat.find(t => t.template === 'line_chart')).toBeUndefined();
+    });
+  });
+
+  test('GENUI_LINE_CHART=true → catalog includes line_chart', async () => {
+    await withEnv({ GENUI_ENABLED: 'true', GENUI_LINE_CHART: 'true' }, () => {
+      const cat = getTemplateCatalog();
+      const entry = cat.find(t => t.template === 'line_chart');
+      expect(entry).toBeDefined();
+      expect(entry!.category).toBe('finance');
+      expect(entry!.view).toBe('chart');
+    });
+  });
+
+  test('decideRender skips render_chart with template_not_in_catalog when flag off', async () => {
+    await withEnv(
+      { GENUI_ENABLED: 'true', GENUI_BASE_URL: PORTAL, GENUI_LINE_CHART: 'false' },
+      () => {
+        const out = decideRender(
+          loadGenuiConfig(),
+          'render_chart',
+          { title: 'x', x_label: 'a', y_label: 'b', series: [] },
+          { _genui_template: 'line_chart', title: 'x' },
+        );
+        expect(out.shouldRender).toBe(false);
+        expect(out.reasons).toContain('template_not_in_catalog');
+      },
+    );
+  });
+
+  test('decideRender renders render_chart when GENUI_LINE_CHART=true', async () => {
+    await withEnv(
+      { GENUI_ENABLED: 'true', GENUI_BASE_URL: PORTAL, GENUI_LINE_CHART: 'true' },
+      () => {
+        const out = decideRender(
+          loadGenuiConfig(),
+          'render_chart',
+          {},
+          { _genui_template: 'line_chart', title: 'x' },
+        );
+        expect(out.shouldRender).toBe(true);
+        expect(out.template).toBe('line_chart');
+        expect(out.category).toBe('finance');
+      },
+    );
+  });
+});
+
+describe('shapeLineChart', () => {
+  test('passes through render_chart handler output (marker shape)', () => {
+    const result = {
+      _genui_template: 'line_chart',
+      title: 'AAPL',
+      x_axis: { label: 'Date', field: 'x' },
+      y_axis: { label: 'Price', field: 'y', format: 'currency' },
+      series: [{ name: 'AAPL', points: [{ x: '2025-01', y: 200 }] }],
+    };
+    const out = shapeLineChart({}, result) as Record<string, unknown>;
+    expect(out._genui_template).toBeUndefined();
+    expect(out.title).toBe('AAPL');
+    expect((out.series as unknown[]).length).toBe(1);
+  });
+
+  test('builds chart from search result with 2-column numeric markdown table', () => {
+    const result = [{
+      slug: 'mongodb_data',
+      title: 'MongoDB Stock Price Evolution',
+      chunk_text: '# MongoDB\n\n| Year | Closing Price |\n| :--- | :--- |\n| 2018 | $83.74 |\n| 2019 | $131.61 |\n| 2020 | $359.04 |',
+    }];
+    const out = shapeLineChart({}, result) as Record<string, unknown>;
+    expect(out).not.toBeNull();
+    expect((out.x_axis as Record<string, unknown>).label).toBe('Year');
+    expect((out.y_axis as Record<string, unknown>).label).toBe('Closing Price');
+    expect((out.y_axis as Record<string, unknown>).format).toBe('currency');
+    const series = out.series as Array<{ name: string; points: { x: unknown; y: number }[] }>;
+    expect(series[0].points.length).toBe(3);
+    expect(series[0].points[0]).toEqual({ x: 2018, y: 83.74 });
+  });
+
+  test('returns null when markdown table has non-numeric Y values', () => {
+    const result = [{
+      slug: 'x',
+      chunk_text: '| A | B |\n| :--- | :--- |\n| foo | bar |\n| baz | qux |',
+    }];
+    expect(shapeLineChart({}, result)).toBeNull();
+  });
+
+  test('returns null for shapes that aren\'t chartable', () => {
+    expect(shapeLineChart({}, 'string')).toBeNull();
+    expect(shapeLineChart({}, [{ slug: 'x', chunk_text: 'no table' }])).toBeNull();
+    expect(shapeLineChart({}, { irrelevant: 'object' })).toBeNull();
+  });
+});
+
+describe('shapePortalPayload — line_chart', () => {
+  test('returns chart payload when result is shapable', () => {
+    const result = {
+      _genui_template: 'line_chart',
+      title: 'AAPL',
+      x_axis: { label: 'Date', field: 'x' },
+      y_axis: { label: 'Price', field: 'y' },
+      series: [{ name: 'AAPL', points: [{ x: 1, y: 200 }] }],
+    };
+    const out = shapePortalPayload('line_chart', {}, result) as Record<string, unknown>;
+    expect(out._genui_template).toBeUndefined();
+    expect(out.title).toBe('AAPL');
+  });
+
+  test('falls back to raw result when shape doesn\'t match', () => {
+    // Portal will 400 — and the response_body lands in the debug log.
+    const raw = { not: 'a chart' };
+    expect(shapePortalPayload('line_chart', {}, raw)).toBe(raw);
   });
 });
 

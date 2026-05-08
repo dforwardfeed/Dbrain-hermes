@@ -124,6 +124,103 @@ describe('dispatch with GenUI middleware', () => {
     );
   });
 
+  test('render_chart op produces ui artifact when GENUI_LINE_CHART=true', async () => {
+    let captured: Record<string, unknown> | null = null;
+    setArtifactClient(async (input) => {
+      captured = input.body as Record<string, unknown>;
+      return { id: 'ui_chart_1', url: `${PORTAL}/ui/latest/ui_chart_1`, status: 'temporary' };
+    });
+    await withEnv(
+      {
+        GENUI_ENABLED: 'true',
+        GENUI_MODE: 'auto',
+        GENUI_BASE_URL: PORTAL,
+        GENUI_LINE_CHART: 'true',
+      },
+      async () => {
+        const out = await dispatchToolCall(engine, 'render_chart', {
+          title: 'AAPL last year',
+          x_label: 'Date',
+          y_label: 'Closing price',
+          y_format: 'currency',
+          series: [
+            {
+              name: 'AAPL',
+              points: [
+                { x: '2025-01', y: 200 },
+                { x: '2025-06', y: 215 },
+                { x: '2025-12', y: 250 },
+              ],
+            },
+          ],
+        });
+        expect(out.isError).toBeFalsy();
+        const parsed = JSON.parse(out.content[0].text) as Record<string, unknown>;
+        expect(parsed).toHaveProperty('ui');
+        const ui = parsed.ui as Record<string, unknown>;
+        expect(ui.id).toBe('ui_chart_1');
+        expect(ui.category).toBe('finance');
+        expect(ui.type).toBe('line_chart');
+        // The portal received a chart-shaped payload, not the marker.
+        expect(captured).not.toBeNull();
+        const payload = (captured as Record<string, unknown>).payload as Record<string, unknown>;
+        expect(payload.title).toBe('AAPL last year');
+        expect(payload._genui_template).toBeUndefined();
+        expect((payload.y_axis as Record<string, unknown>).format).toBe('currency');
+      },
+    );
+  });
+
+  test('render_chart op skipped (no ui artifact) when GENUI_LINE_CHART=false', async () => {
+    let posted = false;
+    setArtifactClient(async () => {
+      posted = true;
+      return { id: 'never' };
+    });
+    await withEnv(
+      { GENUI_ENABLED: 'true', GENUI_MODE: 'auto', GENUI_BASE_URL: PORTAL, GENUI_LINE_CHART: 'false' },
+      async () => {
+        const out = await dispatchToolCall(engine, 'render_chart', {
+          title: 'x', x_label: 'a', y_label: 'b',
+          series: [{ name: 's', points: [{ x: 1, y: 2 }] }],
+        });
+        expect(out.isError).toBeFalsy();
+        // Result still ships (MCP behavior preserved); just no ui field.
+        const parsed = JSON.parse(out.content[0].text);
+        expect(parsed).toHaveProperty('_genui_template');
+        expect(parsed.ui).toBeUndefined();
+        expect(posted).toBe(false);
+      },
+    );
+  });
+
+  test('render_chart op rejects empty series with invalid_params', async () => {
+    await withEnv(
+      { GENUI_ENABLED: 'true', GENUI_BASE_URL: PORTAL, GENUI_LINE_CHART: 'true' },
+      async () => {
+        const out = await dispatchToolCall(engine, 'render_chart', {
+          title: 'x', x_label: 'a', y_label: 'b', series: [],
+        });
+        expect(out.isError).toBe(true);
+        const parsed = JSON.parse(out.content[0].text) as Record<string, unknown>;
+        expect(parsed.error).toBe('invalid_params');
+      },
+    );
+  });
+
+  test('render_chart op rejects non-numeric y values', async () => {
+    await withEnv(
+      { GENUI_ENABLED: 'true', GENUI_BASE_URL: PORTAL, GENUI_LINE_CHART: 'true' },
+      async () => {
+        const out = await dispatchToolCall(engine, 'render_chart', {
+          title: 'x', x_label: 'a', y_label: 'b',
+          series: [{ name: 's', points: [{ x: 1, y: 'NaN' }] }],
+        });
+        expect(out.isError).toBe(true);
+      },
+    );
+  });
+
   test('write op (put_page, dry_run) does NOT auto-render even with GenUI enabled', async () => {
     let posted = false;
     setArtifactClient(async () => {

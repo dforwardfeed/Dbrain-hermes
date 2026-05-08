@@ -110,38 +110,65 @@ any of them, add an entry to `TEMPLATE_CATALOG` in
 `src/mcp/ui-middleware.ts` and the LLM view-picker will start emitting
 them automatically when the data shape fits.
 
-### `line_chart` (high priority — unlocks the MongoDB stock-price use case)
+### `line_chart` (GBrain side ready — pending Hermes renderer)
 
-Simple x/y line chart. The shaper output below matches what
-`parseMarkdownTable` already produces when the source markdown table has
-exactly two columns and the second column is numeric.
+GBrain ships the line_chart pipeline behind `GENUI_LINE_CHART=true`
+(default off). When the flag is on AND the Hermes portal can render
+`line_chart`, three paths produce chart artifacts:
+
+1. **Explicit:** the agent calls the new `render_chart` MCP op with
+   `{title, x_label, y_label, series, y_format?, source_url?}`. Use
+   this when the agent has data from web search (Tavily/Exa) or any
+   non-brain source.
+2. **Auto from search:** when `mcp_gbrain_search` returns a single hit
+   whose `chunk_text` contains a 2-column numeric markdown table (every
+   row in col 2 is numeric), `shapeLineChart` builds the chart payload
+   from that table. The LLM view-picker (when on) routes such results
+   to `line_chart` automatically.
+3. **Auto from explicit chart payload:** any handler that returns
+   `{_genui_template: "line_chart", title, x_axis, y_axis, series}` is
+   recognized as already chart-shaped; the marker is stripped on the way
+   to the portal.
+
+Until `GENUI_LINE_CHART=true` is set, the catalog gate in
+`decideRender` skips line_chart artifacts cleanly with reason
+`template_not_in_catalog` — no failed POSTs.
+
+The portal-side renderer must accept this payload shape:
 
 ```json
 {
   "renderSpec": { "kind": "template", "template": "line_chart", "props": {} },
   "payload": {
-    "title": "MongoDB Stock Price Evolution",
-    "x_axis": { "label": "Year", "field": "Year" },
-    "y_axis": { "label": "Closing Price", "field": "Closing Price", "format": "currency" },
+    "title": "AAPL closing price, last 12 months",
+    "x_axis": { "label": "Date", "field": "x" },
+    "y_axis": { "label": "Closing price", "field": "y", "format": "currency" },
     "series": [
       {
-        "name": "Closing Price",
+        "name": "AAPL",
         "points": [
-          { "Year": 2018, "Closing Price": 83.74 },
-          { "Year": 2019, "Closing Price": 131.61 }
+          { "x": "2025-01", "y": 200.12 },
+          { "x": "2025-02", "y": 215.40 }
         ]
       }
     ],
-    "source_slug": "mongodb_data"
+    "source_url": "https://example.com/article",
+    "source_slug": "wiki/people/example"
   }
 }
 ```
 
-GBrain mapping (proposed): when `parseMarkdownTable` returns a 2-column
-table where every cell in column 2 is numeric AND column 1 looks like a
-year/date, the picker emits `line_chart` with the schema above. Falls
-back to `search_table` markdown-swap when the chart template isn't in
-the portal yet.
+`x` is a string (date label) or number (year/index). `y` is always a
+finite number. `y_axis.format` is one of `number` | `currency` | `percent`.
+Multiple series are allowed for overlay charts. `source_url` and
+`source_slug` are optional citation hints — render as a small caption
+below the chart if the renderer supports it.
+
+To enable end-to-end:
+1. `daniel-hermes`: implement the `line_chart` renderer + register the
+   template in the portal validator.
+2. Railway: set `GENUI_LINE_CHART=true` on the Hermes service env.
+3. Redeploy. `[genui-boot] line_chart_enabled=true` confirms.
 
 ### `bar_chart`
 

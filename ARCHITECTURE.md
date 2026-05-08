@@ -387,13 +387,25 @@ unwrapping `{result, ui}` upstream — debug on the Hermes side.
 - ✅ Layer 1 markdown-table swap shipped (commit `106ceb0`): MongoDB-style
   search results render as a clean Year/Price table.
 - ✅ Layer 2 LLM view-picker shipped, **off by default**. Enable with
-  `GENUI_VIEW_PICKER=true` on the Hermes Railway env.
-- ⏳ Portal currently renders only `search_table`, `stats_dashboard`,
-  `timeline_view`, `jobs_status`, `generic_cards`. Charts not yet
-  available.
-- ⏳ `line_chart` / `bar_chart` / `markdown_view` / `metric_card` are
-  documented in `docs/genui-portal-templates.md` and waiting on Hermes-side
-  renderer work.
+  `GENUI_VIEW_PICKER=true` on the Hermes Railway env. (User reported
+  enabling — verify via `[genui-boot] view_picker_enabled=true` in the
+  log; a typo like `ture` silently parses as false.)
+- ✅ `line_chart` GBrain-side support shipped behind `GENUI_LINE_CHART=true`
+  feature flag (default off). Includes:
+  - New `render_chart` MCP op for the agent to call after assembling
+    x/y data from any source (Tavily / Exa / a finance MCP / etc.).
+  - `shapeLineChart()` shaper that also detects 2-column-numeric
+    markdown tables in search results so the LLM picker can route
+    chartable data automatically.
+  - Catalog-validation gate in `decideRender` that skips with
+    `template_not_in_catalog` when the flag is off — keeps the system
+    safe before Hermes ships the renderer.
+- ⏳ **Hermes-side `line_chart` renderer required.** Until `daniel-hermes`
+  ships the portal renderer AND the Railway env sets
+  `GENUI_LINE_CHART=true`, the catalog gate keeps line_chart artifacts
+  from being POSTed (artifact_post would otherwise 400).
+- ⏳ `bar_chart` / `markdown_view` / `metric_card` still pending —
+  documented in `docs/genui-portal-templates.md`.
 
 ## 9. Common mistakes to avoid
 
@@ -419,9 +431,17 @@ unwrapping `{result, ui}` upstream — debug on the Hermes side.
 
 ## 10. Future improvements
 
-- **Charts (line / bar):** add Hermes-side renderers, register in
-  `TEMPLATE_CATALOG`, optionally add a shaper that detects
-  numeric-column markdown tables → line chart payload.
+- **Charts — `line_chart`:** GBrain side ready (`render_chart` op,
+  shaper, catalog entry behind `GENUI_LINE_CHART=true`). Pending:
+  Hermes portal renderer in `daniel-hermes`. Schema documented in
+  `docs/genui-portal-templates.md`. Once shipped, set
+  `GENUI_LINE_CHART=true` on Railway and any agent prompt like
+  "search Apple's stock prices last year and chart them" can call
+  `mcp_gbrain_render_chart` with the points it gathered from
+  Tavily/Exa.
+- **Charts — `bar_chart`:** same model as line_chart; would add a
+  second optional template + a `render_bar_chart` op (or fold into
+  `render_chart` with a `kind` param).
 - **`markdown_view` template:** dedicated long-document render; today
   long markdown is force-fit into `search_table` and looks bad.
 - **`metric_card`:** big-number callouts for `get_stats` / autopilot
