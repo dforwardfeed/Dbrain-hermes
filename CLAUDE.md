@@ -1,5 +1,19 @@
 # CLAUDE.md
 
+> **Fork notice — read FIRST.** This is `dforwardfeed/Dbrain-hermes`, a fork
+> of upstream `garrytan/gbrain`. **Before making architecture or GenUI
+> changes, read [`ARCHITECTURE.md`](ARCHITECTURE.md).** Railway deploys
+> `dforwardfeed/daniel-hermes` (the Hermes wrapper at
+> `C:\coding-projects\daniel-hermes`), not this repo — this repo is pulled
+> into `/data/gbrain` at runtime. Changes to portal routes, render templates,
+> artifact storage, Dockerfile, or admin dashboard belong in `daniel-hermes`.
+> Changes to MCP dispatch (`src/mcp/dispatch.ts`), the GenUI decision
+> engine (`src/mcp/ui-middleware.ts`), artifact payload shaping, operation
+> metadata (`src/core/operations.ts`), and skills belong here. The two-repo
+> deploy workflow, end-to-end GenUI flow, debug-log triage matrix, and
+> per-repo responsibility split are documented in `ARCHITECTURE.md` — keep
+> it updated whenever the approach changes.
+
 GBrain is a personal knowledge brain and GStack mod for agent platforms. Pluggable
 engines: PGLite (embedded Postgres via WASM, zero-config default) or Postgres + pgvector
 + hybrid search in a managed Supabase instance. `gbrain init` defaults to PGLite;
