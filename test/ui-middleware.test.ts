@@ -502,6 +502,66 @@ describe('maybeRenderUi', () => {
   });
 });
 
+// --- File-based debug logging ---
+
+describe('GENUI_DEBUG_LOG file logging', () => {
+  beforeEach(() => setArtifactClient(null));
+  afterEach(() => setArtifactClient(null));
+
+  test('writes JSONL records to GENUI_DEBUG_LOG when set, never throws on bad path', async () => {
+    const { mkdtempSync, readFileSync, existsSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { _resetDebugLogPathForTests } = await import('../src/mcp/ui-middleware.ts');
+
+    const dir = mkdtempSync(join(tmpdir(), 'genui-test-'));
+    const logPath = join(dir, 'mcp-genui.log');
+
+    setArtifactClient(async () => ({ id: 'art-log-1', url: 'https://example.test/ui/latest/art-log-1' }));
+    _resetDebugLogPathForTests();
+    await withEnv(
+      { GENUI_ENABLED: 'true', GENUI_BASE_URL: PORTAL, GENUI_DEBUG_LOG: logPath },
+      async () => {
+        const out = await maybeRenderUi({
+          operation: 'search',
+          params: { query: 'x' },
+          result: searchResults(),
+          ctx: fakeCtx(),
+        });
+        expect(out).not.toBeNull();
+      },
+    );
+    _resetDebugLogPathForTests();
+
+    expect(existsSync(logPath)).toBe(true);
+    const lines = readFileSync(logPath, 'utf8').split(/\n/).filter(Boolean);
+    // Should contain at least one decision record.
+    const events = lines.map(l => JSON.parse(l).event);
+    expect(events).toContain('decision');
+  });
+
+  test('unwritable log path does not throw or break dispatch', async () => {
+    const { _resetDebugLogPathForTests } = await import('../src/mcp/ui-middleware.ts');
+    setArtifactClient(async () => ({ id: 'art-bad-path' }));
+    _resetDebugLogPathForTests();
+    // A path under a file (not a directory) — mkdir will fail.
+    await withEnv(
+      { GENUI_ENABLED: 'true', GENUI_BASE_URL: PORTAL, GENUI_DEBUG_LOG: '/dev/null/cannot-be-a-dir/log.jsonl' },
+      async () => {
+        const out = await maybeRenderUi({
+          operation: 'search',
+          params: { query: 'x' },
+          result: searchResults(),
+          ctx: fakeCtx(),
+        });
+        // Should still render UI; file-log is best-effort.
+        expect(out).not.toBeNull();
+      },
+    );
+    _resetDebugLogPathForTests();
+  });
+});
+
 // --- Operation name normalization ---
 
 describe('normalizeOperationName', () => {

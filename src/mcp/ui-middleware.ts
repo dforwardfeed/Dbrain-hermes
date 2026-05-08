@@ -20,18 +20,74 @@
  * `globalThis.fetch`.
  */
 
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname } from 'node:path';
 import type { OperationContext } from '../core/operations.ts';
 import { operations } from '../core/operations.ts';
 
-// --- Debug logging (always-on; concise, no payload values) ---
+// --- Debug logging ---
 //
-// Intentionally writes to stderr directly (NOT through ctx.logger) so the lines
-// land in Railway/Fly.io stdout|stderr capture for the gbrain subprocess
-// regardless of how a parent MCP client routes logger.info. Removable when the
-// GenUI rollout has stabilized.
+// Two channels, both always-on, both best-effort (errors swallowed):
+//   1. stderr — human-readable `[genui-<event>] <json>` line per record.
+//      Useful when stderr is captured by the parent process (Railway/Fly).
+//   2. JSONL file — each record on its own line at GENUI_DEBUG_LOG (default:
+//      /data/genui/gbrain-mcp-genui.log). Useful when stderr is NOT captured
+//      because the gbrain subprocess is running headless under an agent like
+//      Hermes — the user can `tail -f` the file from Telegram or shell.
+//
+// Never writes secret material. Token presence is signaled via length only.
 
-function debugLog(line: string): void {
-  try { process.stderr.write(line.endsWith('\n') ? line : line + '\n'); } catch { /* never throw from logger */ }
+const DEFAULT_DEBUG_LOG_PATH = '/data/genui/gbrain-mcp-genui.log';
+
+let _fileLogReady: { path: string; ready: boolean } | null = null;
+
+function resolveDebugLogPath(): string {
+  const env = (typeof process !== 'undefined' ? process.env : {}) as Record<string, string | undefined>;
+  const override = env.GENUI_DEBUG_LOG?.trim();
+  return override && override.length > 0 ? override : DEFAULT_DEBUG_LOG_PATH;
+}
+
+function ensureFileLogReady(path: string): boolean {
+  if (_fileLogReady && _fileLogReady.path === path) return _fileLogReady.ready;
+  let ready = false;
+  try {
+    mkdirSync(dirname(path), { recursive: true });
+    ready = true;
+  } catch {
+    ready = false;
+  }
+  _fileLogReady = { path, ready };
+  return ready;
+}
+
+function debugLogStderr(line: string): void {
+  try { process.stderr.write(line.endsWith('\n') ? line : line + '\n'); } catch { /* swallow */ }
+}
+
+function debugLogFile(jsonLine: string): void {
+  try {
+    const path = resolveDebugLogPath();
+    if (!ensureFileLogReady(path)) return;
+    appendFileSync(path, jsonLine.endsWith('\n') ? jsonLine : jsonLine + '\n', { encoding: 'utf8' });
+  } catch { /* swallow — file logging is best-effort */ }
+}
+
+/**
+ * Emit one structured debug record. Writes to BOTH stderr (legacy `[genui-*]`
+ * format) and the JSONL file at `GENUI_DEBUG_LOG`. Never throws.
+ */
+function recordDebug(event: string, fields: Record<string, unknown>): void {
+  const entry = { ts: new Date().toISOString(), event, ...fields };
+  let serialized: string;
+  try { serialized = JSON.stringify(entry); }
+  catch { serialized = JSON.stringify({ ts: entry.ts, event, _serialize_error: true }); }
+  debugLogStderr(`[genui-${event}] ${serialized}`);
+  debugLogFile(serialized);
+}
+
+/** Test-only seam: clear the cached "did we successfully mkdir?" memo. */
+export function _resetDebugLogPathForTests(): void {
+  _fileLogReady = null;
 }
 
 /**
@@ -55,12 +111,17 @@ export function normalizeOperationName(name: string): string {
  */
 export function logGenuiBoot(): void {
   const cfg = loadGenuiConfig();
-  debugLog(
-    `[genui-boot] enabled=${cfg.enabled} mode=${cfg.mode} ` +
-    `base_url_set=${!!cfg.baseUrl} token_len=${cfg.apiToken ? cfg.apiToken.length : 0} ` +
-    `render_for=${[...cfg.renderFor].join(',')} ttl_hours=${cfg.ttlHours} ` +
-    `max_payload_bytes=${cfg.maxPayloadBytes} timeout_ms=${cfg.timeoutMs}`,
-  );
+  recordDebug('boot', {
+    enabled: cfg.enabled,
+    mode: cfg.mode,
+    base_url_set: !!cfg.baseUrl,
+    token_len: cfg.apiToken ? cfg.apiToken.length : 0,
+    render_for: [...cfg.renderFor],
+    ttl_hours: cfg.ttlHours,
+    max_payload_bytes: cfg.maxPayloadBytes,
+    timeout_ms: cfg.timeoutMs,
+    debug_log_path: resolveDebugLogPath(),
+  });
 }
 
 /**
@@ -74,13 +135,17 @@ export function logGenuiDispatchEntry(operation: string, result: unknown): void 
   const normalized = normalizeOperationName(operation);
   const isArr = Array.isArray(result);
   const len = isArr ? (result as unknown[]).length : -1;
-  const ruleHit = !!UI_RULES[normalized];
-  debugLog(
-    `[genui-dispatch] operation=${operation} normalized=${normalized} ` +
-    `enabled=${cfg.enabled} mode=${cfg.mode} base_url_set=${!!cfg.baseUrl} ` +
-    `token_len=${cfg.apiToken ? cfg.apiToken.length : 0} ` +
-    `result_array=${isArr} result_len=${len} rule_hit=${ruleHit}`,
-  );
+  recordDebug('dispatch', {
+    operation,
+    normalized_operation: normalized,
+    enabled: cfg.enabled,
+    mode: cfg.mode,
+    base_url_set: !!cfg.baseUrl,
+    token_len: cfg.apiToken ? cfg.apiToken.length : 0,
+    result_is_array: isArr,
+    result_len: len,
+    rule_hit: !!UI_RULES[normalized],
+  });
 }
 
 // --- Public types ---
@@ -340,21 +405,42 @@ async function defaultArtifactClient(input: ArtifactPostInput): Promise<Artifact
   const signal = (AbortSignal as { timeout?: (ms: number) => AbortSignal }).timeout?.(input.timeoutMs)
     ?? makeFallbackTimeoutSignal(input.timeoutMs);
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(input.body),
-    signal,
-  });
-  debugLog(`[genui-artifact] status=${res.status} ok=${res.ok}`);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(input.body),
+      signal,
+    });
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    recordDebug('error', { stage: 'artifact_post_fetch', message: msg });
+    throw e;
+  }
   if (!res.ok) {
+    recordDebug('artifact_post', { status: res.status, ok: false, url_created: false });
     throw new Error(`GenUI portal responded ${res.status}`);
   }
-  const json = await res.json() as Record<string, unknown>;
+  let json: Record<string, unknown>;
+  try { json = await res.json() as Record<string, unknown>; }
+  catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    recordDebug('error', { stage: 'artifact_post_parse', message: msg });
+    throw new Error(`GenUI portal returned non-JSON: ${msg}`);
+  }
   // Support both shapes: { id, url, status } and { artifact: { id, url, status } }.
   const inner = isPlainObject(json.artifact) ? json.artifact : json;
   const id = typeof inner.id === 'string' ? inner.id : undefined;
-  if (!id) throw new Error('GenUI portal response missing id');
+  if (!id) {
+    recordDebug('error', { stage: 'artifact_post_response', message: 'missing id in response' });
+    throw new Error('GenUI portal response missing id');
+  }
+  recordDebug('artifact_post', {
+    status: res.status,
+    ok: true,
+    url_created: typeof inner.url === 'string' && (inner.url as string).length > 0,
+  });
   return {
     id,
     url: typeof inner.url === 'string' ? inner.url : undefined,
@@ -559,7 +645,7 @@ export async function maybeRenderUi(input: MaybeRenderUiInput): Promise<UiArtifa
       ...extra,
     };
     if (operation !== input.operation) entry.raw_operation = input.operation;
-    debugLog(`[genui-decision] ${JSON.stringify(entry)}`);
+    recordDebug('decision', entry);
   };
 
   if (!decision.shouldRender) {
