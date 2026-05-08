@@ -419,8 +419,23 @@ async function defaultArtifactClient(input: ArtifactPostInput): Promise<Artifact
     throw e;
   }
   if (!res.ok) {
-    recordDebug('artifact_post', { status: res.status, ok: false, url_created: false });
-    throw new Error(`GenUI portal responded ${res.status}`);
+    // Capture the portal's validation message body (truncated, never logs
+    // request material). Critical for diagnosing 400/422 schema mismatches —
+    // status code alone doesn't tell us which field the portal rejected.
+    let bodyExcerpt = '';
+    try {
+      const text = await res.text();
+      bodyExcerpt = text.length > 1000 ? text.slice(0, 1000) + '…[truncated]' : text;
+    } catch (e: unknown) {
+      bodyExcerpt = `<read-failed: ${e instanceof Error ? e.message : String(e)}>`;
+    }
+    recordDebug('artifact_post', {
+      status: res.status,
+      ok: false,
+      url_created: false,
+      response_body: bodyExcerpt,
+    });
+    throw new Error(`GenUI portal responded ${res.status}: ${bodyExcerpt.slice(0, 200)}`);
   }
   let json: Record<string, unknown>;
   try { json = await res.json() as Record<string, unknown>; }
@@ -623,6 +638,83 @@ function deriveTitle(operation: string, params: Record<string, unknown>, overrid
   return operation;
 }
 
+// --- Portal payload shapers ---
+//
+// The MCP `result` returned to the agent is always the raw operation output.
+// The artifact `payload` sent to the portal is normalized per template so each
+// renderer can pluck `columns`/`rows`/`entries`/etc. directly. If a shaper
+// can't recognize the input, it falls back to the raw result unchanged so a
+// future portal-side schema change doesn't silently start dropping data.
+
+const SEARCH_TABLE_COLUMNS = ['title', 'slug', 'type', 'score', 'chunk_text'];
+const TIMELINE_COLUMNS = ['date', 'source', 'summary', 'detail'];
+const JOBS_STATUS_COLUMNS = ['id', 'name', 'queue', 'status', 'created_at', 'started_at', 'finished_at', 'error_text'];
+
+function pickFields<T extends Record<string, unknown>>(row: T, cols: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const c of cols) out[c] = row[c] ?? null;
+  return out;
+}
+
+function shapeSearchTable(params: Record<string, unknown>, result: unknown): Record<string, unknown> {
+  const query = (typeof params.query === 'string' ? params.query : '') ||
+                (typeof params.q === 'string' ? params.q : '');
+  const rows = Array.isArray(result)
+    ? (result as Record<string, unknown>[])
+        .filter(r => isPlainObject(r))
+        .map(r => pickFields(r, SEARCH_TABLE_COLUMNS))
+    : [];
+  return { query, columns: SEARCH_TABLE_COLUMNS, rows };
+}
+
+function shapeTimelineView(params: Record<string, unknown>, result: unknown): Record<string, unknown> {
+  const slug = typeof params.slug === 'string' ? params.slug : '';
+  const entries = Array.isArray(result)
+    ? (result as Record<string, unknown>[])
+        .filter(r => isPlainObject(r))
+        .map(r => pickFields(r, TIMELINE_COLUMNS))
+    : [];
+  return { slug, columns: TIMELINE_COLUMNS, entries };
+}
+
+function shapeJobsStatus(_params: Record<string, unknown>, result: unknown): Record<string, unknown> {
+  const list = Array.isArray(result) ? result : (isPlainObject(result) ? [result] : []);
+  const rows = (list as Record<string, unknown>[])
+    .filter(r => isPlainObject(r))
+    .map(r => pickFields(r, JOBS_STATUS_COLUMNS));
+  return { columns: JOBS_STATUS_COLUMNS, rows };
+}
+
+function shapeStatsDashboard(_params: Record<string, unknown>, result: unknown): Record<string, unknown> {
+  if (!isPlainObject(result)) return { metrics: {} };
+  // Coerce flat numeric fields into a metrics dict the dashboard can render.
+  const metrics: Record<string, number> = {};
+  for (const [k, v] of Object.entries(result)) if (typeof v === 'number') metrics[k] = v;
+  return { metrics, raw: result };
+}
+
+function shapeGenericCards(_params: Record<string, unknown>, result: unknown): Record<string, unknown> {
+  if (Array.isArray(result)) {
+    const cards = (result as unknown[])
+      .filter(r => isPlainObject(r))
+      .map(r => r as Record<string, unknown>);
+    return { cards };
+  }
+  if (isPlainObject(result)) return { cards: [result] };
+  return { cards: [] };
+}
+
+export function shapePortalPayload(template: string, params: Record<string, unknown>, result: unknown): unknown {
+  switch (template) {
+    case 'search_table':    return shapeSearchTable(params, result);
+    case 'timeline_view':   return shapeTimelineView(params, result);
+    case 'jobs_status':     return shapeJobsStatus(params, result);
+    case 'stats_dashboard': return shapeStatsDashboard(params, result);
+    case 'generic_cards':   return shapeGenericCards(params, result);
+    default:                return result;
+  }
+}
+
 // --- Public entry point ---
 
 export async function maybeRenderUi(input: MaybeRenderUiInput): Promise<UiArtifactSummary | null> {
@@ -661,6 +753,11 @@ export async function maybeRenderUi(input: MaybeRenderUiInput): Promise<UiArtifa
   const title = deriveTitle(operation, input.params, decision.override);
   const createdAt = new Date();
   const expiresAt = new Date(createdAt.getTime() + cfg.ttlHours * 3600 * 1000);
+  // Shape the payload to match what the portal template expects. The MCP
+  // response (`result`) is unchanged — only the artifact's `payload` field
+  // is normalized so the portal can render directly without each template
+  // re-deriving columns/rows from a heterogeneous shape.
+  const portalPayload = shapePortalPayload(decision.template!, input.params, input.result);
   const body = {
     title,
     category: decision.category!,
@@ -672,7 +769,7 @@ export async function maybeRenderUi(input: MaybeRenderUiInput): Promise<UiArtifa
       transport: 'unknown',
       trigger: 'chat',
     },
-    payload: input.result,
+    payload: portalPayload,
     renderSpec: {
       kind: 'template' as const,
       template: decision.template!,

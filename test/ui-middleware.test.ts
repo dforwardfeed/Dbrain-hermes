@@ -26,6 +26,7 @@ import {
   setArtifactClient,
   maybeRenderUi,
   normalizeOperationName,
+  shapePortalPayload,
   UI_RULES,
   type ArtifactClient,
   type GenuiConfig,
@@ -577,6 +578,55 @@ describe('normalizeOperationName', () => {
   });
   test('does not strip random underscores', () => {
     expect(normalizeOperationName('something_unrelated')).toBe('something_unrelated');
+  });
+});
+
+// --- shapePortalPayload ---
+
+describe('shapePortalPayload', () => {
+  test('search_table returns { query, columns, rows } with expected columns', () => {
+    const out = shapePortalPayload('search_table', { query: 'mongodb' }, searchResults(2)) as Record<string, unknown>;
+    expect(out.query).toBe('mongodb');
+    expect(out.columns).toEqual(['title', 'slug', 'type', 'score', 'chunk_text']);
+    const rows = out.rows as Record<string, unknown>[];
+    expect(rows.length).toBe(2);
+    expect(rows[0]).toHaveProperty('title');
+    expect(rows[0]).toHaveProperty('slug');
+    expect(rows[0]).toHaveProperty('score');
+  });
+
+  test('search_table accepts params.q as fallback for query', () => {
+    const out = shapePortalPayload('search_table', { q: 'fallback' }, searchResults(1)) as Record<string, unknown>;
+    expect(out.query).toBe('fallback');
+  });
+
+  test('search_table on non-array result returns empty rows, never throws', () => {
+    const out = shapePortalPayload('search_table', { query: 'q' }, 'not an array') as Record<string, unknown>;
+    expect(out.rows).toEqual([]);
+  });
+
+  test('jobs_status maps to columns + rows', () => {
+    const out = shapePortalPayload('jobs_status', {}, jobsList()) as Record<string, unknown>;
+    expect(out.columns).toEqual(expect.arrayContaining(['id', 'name', 'status']));
+    expect((out.rows as unknown[]).length).toBe(2);
+  });
+
+  test('timeline_view maps to slug + entries', () => {
+    const out = shapePortalPayload('timeline_view', { slug: 'x' }, timelineEntries()) as Record<string, unknown>;
+    expect(out.slug).toBe('x');
+    expect((out.entries as unknown[]).length).toBeGreaterThan(0);
+  });
+
+  test('stats_dashboard extracts numeric metrics', () => {
+    const out = shapePortalPayload('stats_dashboard', {}, statsResult()) as Record<string, unknown>;
+    const metrics = out.metrics as Record<string, number>;
+    expect(metrics.pages).toBe(1234);
+    expect(metrics.chunks).toBe(5678);
+  });
+
+  test('unknown template falls back to raw result', () => {
+    const raw = { hello: 'world' };
+    expect(shapePortalPayload('mystery', {}, raw)).toBe(raw);
   });
 });
 
