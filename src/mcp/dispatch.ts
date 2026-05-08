@@ -10,7 +10,7 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError } from '../core/operations.ts';
 import type { Operation, OperationContext } from '../core/operations.ts';
 import { loadConfig } from '../core/config.ts';
-import { maybeRenderUi } from './ui-middleware.ts';
+import { maybeRenderUi, logGenuiDispatchEntry } from './ui-middleware.ts';
 
 export interface ToolResult {
   content: { type: 'text'; text: string }[];
@@ -199,6 +199,9 @@ export async function dispatchToolCall(
     const result = await op.handler(ctx, safeParams);
 
     // GenUI hook (optional). Never let UI failure fail the MCP response.
+    // Always-on entry log so Railway/Fly.io stderr capture shows env state +
+    // result shape on every tool call until the rollout stabilizes.
+    logGenuiDispatchEntry(op.name, result);
     let ui = null;
     try {
       ui = await maybeRenderUi({

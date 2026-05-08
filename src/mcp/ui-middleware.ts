@@ -20,8 +20,68 @@
  * `globalThis.fetch`.
  */
 
-import type { OperationContext, Operation } from '../core/operations.ts';
+import type { OperationContext } from '../core/operations.ts';
 import { operations } from '../core/operations.ts';
+
+// --- Debug logging (always-on; concise, no payload values) ---
+//
+// Intentionally writes to stderr directly (NOT through ctx.logger) so the lines
+// land in Railway/Fly.io stdout|stderr capture for the gbrain subprocess
+// regardless of how a parent MCP client routes logger.info. Removable when the
+// GenUI rollout has stabilized.
+
+function debugLog(line: string): void {
+  try { process.stderr.write(line.endsWith('\n') ? line : line + '\n'); } catch { /* never throw from logger */ }
+}
+
+/**
+ * Strip MCP-client-side display prefixes (e.g. Claude Desktop / Cursor render
+ * tools as `mcp_<server>_<tool>`). On the wire the bare `<tool>` is what the
+ * spec sends, but if any client-side rewriter or proxy passes the prefixed
+ * name through unchanged, this normalizer keeps `UI_RULES['search']` matching.
+ *
+ * Pattern: `mcp_<lowercase-or-digit>_<rest>` → `<rest>`. Idempotent on bare names.
+ */
+export function normalizeOperationName(name: string): string {
+  const m = /^mcp_[a-z0-9]+_(.+)$/i.exec(name);
+  return m ? m[1] : name;
+}
+
+/**
+ * Always-on boot log. Called by `src/mcp/server.ts` at MCP server startup so
+ * Railway logs show — at the gbrain subprocess level, not Hermes — whether
+ * GenUI is configured. If you don't see this line, the binary you're running
+ * predates the GenUI patch.
+ */
+export function logGenuiBoot(): void {
+  const cfg = loadGenuiConfig();
+  debugLog(
+    `[genui-boot] enabled=${cfg.enabled} mode=${cfg.mode} ` +
+    `base_url_set=${!!cfg.baseUrl} token_len=${cfg.apiToken ? cfg.apiToken.length : 0} ` +
+    `render_for=${[...cfg.renderFor].join(',')} ttl_hours=${cfg.ttlHours} ` +
+    `max_payload_bytes=${cfg.maxPayloadBytes} timeout_ms=${cfg.timeoutMs}`,
+  );
+}
+
+/**
+ * Always-on per-call dispatch log. Called by `src/mcp/dispatch.ts` BEFORE
+ * `maybeRenderUi` runs. Discriminates "wrong binary" / "env var missing" /
+ * "operation name mismatch" / "shape mismatch" from "Hermes is unwrapping the
+ * payload upstream."
+ */
+export function logGenuiDispatchEntry(operation: string, result: unknown): void {
+  const cfg = loadGenuiConfig();
+  const normalized = normalizeOperationName(operation);
+  const isArr = Array.isArray(result);
+  const len = isArr ? (result as unknown[]).length : -1;
+  const ruleHit = !!UI_RULES[normalized];
+  debugLog(
+    `[genui-dispatch] operation=${operation} normalized=${normalized} ` +
+    `enabled=${cfg.enabled} mode=${cfg.mode} base_url_set=${!!cfg.baseUrl} ` +
+    `token_len=${cfg.apiToken ? cfg.apiToken.length : 0} ` +
+    `result_array=${isArr} result_len=${len} rule_hit=${ruleHit}`,
+  );
+}
 
 // --- Public types ---
 
@@ -286,6 +346,7 @@ async function defaultArtifactClient(input: ArtifactPostInput): Promise<Artifact
     body: JSON.stringify(input.body),
     signal,
   });
+  debugLog(`[genui-artifact] status=${res.status} ok=${res.ok}`);
   if (!res.ok) {
     throw new Error(`GenUI portal responded ${res.status}`);
   }
@@ -481,18 +542,24 @@ function deriveTitle(operation: string, params: Record<string, unknown>, overrid
 export async function maybeRenderUi(input: MaybeRenderUiInput): Promise<UiArtifactSummary | null> {
   const startedAt = Date.now();
   const cfg = loadGenuiConfig();
-  const decision = decideRender(cfg, input.operation, input.params, input.result);
+  // Defensive normalization — bare op names are what the MCP wire-protocol
+  // sends, but client-side display rewriters (`mcp_<server>_<tool>`) showing
+  // up here would silently miss UI_RULES.
+  const operation = normalizeOperationName(input.operation);
+  const decision = decideRender(cfg, operation, input.params, input.result);
   const log = (decisionStatus: 'rendered' | 'skipped' | 'failed', extra: Record<string, unknown> = {}) => {
-    const entry = {
-      operation: input.operation,
+    const entry: Record<string, unknown> = {
+      operation,
       decision: decisionStatus,
       category: decision.category,
       view: decision.view,
-      reason: decision.reasons,
+      reasons: decision.reasons,
+      score: decision.score,
       latency_ms: Date.now() - startedAt,
       ...extra,
     };
-    try { input.ctx.logger?.info?.(`[genui] ${JSON.stringify(entry)}`); } catch { /* never throw from logger */ }
+    if (operation !== input.operation) entry.raw_operation = input.operation;
+    debugLog(`[genui-decision] ${JSON.stringify(entry)}`);
   };
 
   if (!decision.shouldRender) {
@@ -505,7 +572,7 @@ export async function maybeRenderUi(input: MaybeRenderUiInput): Promise<UiArtifa
     return null;
   }
 
-  const title = deriveTitle(input.operation, input.params, decision.override);
+  const title = deriveTitle(operation, input.params, decision.override);
   const createdAt = new Date();
   const expiresAt = new Date(createdAt.getTime() + cfg.ttlHours * 3600 * 1000);
   const body = {
@@ -514,8 +581,8 @@ export async function maybeRenderUi(input: MaybeRenderUiInput): Promise<UiArtifa
     viewType: decision.view!,
     status: 'temporary' as const,
     source: {
-      operation: input.operation,
-      paramsSummary: redactParamsSummary(input.operation, input.params),
+      operation,
+      paramsSummary: redactParamsSummary(operation, input.params),
       transport: 'unknown',
       trigger: 'chat',
     },

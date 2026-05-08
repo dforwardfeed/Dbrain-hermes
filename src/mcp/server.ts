@@ -6,8 +6,13 @@ import { operations } from '../core/operations.ts';
 import { VERSION } from '../version.ts';
 import { buildToolDefs } from './tool-defs.ts';
 import { dispatchToolCall, validateParams, buildOperationContext } from './dispatch.ts';
+import { logGenuiBoot } from './ui-middleware.ts';
 
 export async function startMcpServer(engine: BrainEngine) {
+  // Always-on GenUI config snapshot. If you don't see this line in the gbrain
+  // subprocess stderr, the running binary predates the GenUI patch.
+  logGenuiBoot();
+
   const server = new Server(
     { name: 'gbrain', version: VERSION },
     { capabilities: { tools: {} } },

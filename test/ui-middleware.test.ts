@@ -25,6 +25,7 @@ import {
   redactParamsSummary,
   setArtifactClient,
   maybeRenderUi,
+  normalizeOperationName,
   UI_RULES,
   type ArtifactClient,
   type GenuiConfig,
@@ -498,6 +499,24 @@ describe('maybeRenderUi', () => {
       expect(out!.id).toBe('art-w');
       expect(out!.status).toBe('saved');
     });
+  });
+});
+
+// --- Operation name normalization ---
+
+describe('normalizeOperationName', () => {
+  test('strips mcp_<server>_ prefix', () => {
+    expect(normalizeOperationName('mcp_gbrain_search')).toBe('search');
+    expect(normalizeOperationName('mcp_gbrain_list_jobs')).toBe('list_jobs');
+    expect(normalizeOperationName('mcp_gbrain_get_job')).toBe('get_job');
+    expect(normalizeOperationName('mcp_brain_traverse_graph')).toBe('traverse_graph');
+  });
+  test('idempotent on bare names', () => {
+    expect(normalizeOperationName('search')).toBe('search');
+    expect(normalizeOperationName('list_jobs')).toBe('list_jobs');
+  });
+  test('does not strip random underscores', () => {
+    expect(normalizeOperationName('something_unrelated')).toBe('something_unrelated');
   });
 });
 
