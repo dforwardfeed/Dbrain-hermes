@@ -237,7 +237,7 @@ fields. The portal validates against these:
 |---           |---             |--- |
 | `title`      | string         | Header for the artifact card |
 | `category`   | string         | `search`, `graph`, `timeline`, `jobs`, `stats`, `briefing`, `finance` |
-| `viewType`   | string         | `table`, `cards`, `dashboard`, `timeline`, `status`, `chart`, `markdown` |
+| `viewType`   | string         | `table`, `cards`, `dashboard`, `timeline`, `status`, `chart`, `line_chart`, `bar_chart`, `pie_chart`, `area_chart`, `scatter_chart`, `document`, `markdown`, `custom` — semantic/navigation tag, NOT the renderer (renderer is `renderSpec.template`). Hermes portal validator at `daniel-hermes/genui.py:VALID_VIEW_TYPES` is the authoritative enum; keep both repos in sync when adding values. |
 | `status`     | `"temporary"` \| `"saved"` | Default `"temporary"`; portal manages TTL |
 | `source`     | object         | `{ operation, paramsSummary, transport, trigger }` — see below |
 | `payload`    | object         | Template-specific. See sections above. |
