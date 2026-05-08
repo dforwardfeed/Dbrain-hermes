@@ -1773,6 +1773,13 @@ const render_chart: Operation = {
     series: {
       type: 'array',
       required: true,
+      // `items` is required by Google Gemini's stricter JSON Schema validator
+      // — without it `tools[].function_declarations[].parameters.properties[series].items: missing field`
+      // is returned. OpenAI + Anthropic tolerate the omission. The inner shape
+      // (each series is `{name, points: [{x, y}, ...]}`) lives in the
+      // description because ParamDef.items can only express a single nested
+      // type, not full property shapes.
+      items: { type: 'object' },
       description:
         'One or more series, each {name: string, points: [{x, y}, ...]}. y must be a finite number; x can be a string (date) or number. Pass multiple series for an overlay chart.',
     },
