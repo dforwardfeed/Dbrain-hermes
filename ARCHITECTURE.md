@@ -341,13 +341,25 @@ Open the URL in a browser to see the rendered artifact.
 tail -n 120 /data/genui/gbrain-mcp-genui.log
 ```
 
+The file is JSONL — each line is a `{ts, event, ...}` record without a
+prefix. (Stderr lines have a human prefix `[genui-<event>]` for the
+operator's eye, but the file is raw JSON for grep / jq friendliness.)
+
 Filter to one event type:
 
 ```
+grep '"event":"boot"' /data/genui/gbrain-mcp-genui.log | tail -1
+grep '"event":"dispatch"' /data/genui/gbrain-mcp-genui.log | tail -10
 grep '"event":"decision"' /data/genui/gbrain-mcp-genui.log | tail -20
+grep '"event":"view_picker"' /data/genui/gbrain-mcp-genui.log | tail -10
 grep '"event":"artifact_post"' /data/genui/gbrain-mcp-genui.log | tail -10
 grep '"event":"error"' /data/genui/gbrain-mcp-genui.log | tail -20
 ```
+
+Common misuse — `grep genui-boot` matches the **stderr** prefix only.
+That works when stderr is captured by the Hermes process AND surfaced
+to the agent shell, but the file uses the prefix-free JSONL form.
+Always grep `'"event":"boot"'` against the log file.
 
 ### Hit the portal API directly (Windows PowerShell)
 
