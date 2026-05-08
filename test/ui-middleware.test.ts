@@ -27,6 +27,8 @@ import {
   maybeRenderUi,
   normalizeOperationName,
   shapePortalPayload,
+  parseMarkdownTable,
+  TEMPLATE_CATALOG,
   UI_RULES,
   type ArtifactClient,
   type GenuiConfig,
@@ -578,6 +580,94 @@ describe('normalizeOperationName', () => {
   });
   test('does not strip random underscores', () => {
     expect(normalizeOperationName('something_unrelated')).toBe('something_unrelated');
+  });
+});
+
+// --- Layer 1: parseMarkdownTable ---
+
+describe('parseMarkdownTable', () => {
+  test('parses the MongoDB stock-price table the user reported', () => {
+    const text = `# MongoDB Stock Price Evolution (2018-2026)
+
+This document tracks the year-end closing price of MongoDB (MDB).
+
+| Year | Closing Price |
+| :--- | :--- |
+| 2018 | $83.74 |
+| 2019 | $131.61 |
+| 2020 | $359.04 |
+| 2021 | $529.35 |
+| 2022 | $196.84 |
+| 2023 | $408.85 |
+| 2024 | $232.81 |
+| 2025 | $419.69 |
+| 2026 (May) | $293.42 |`;
+    const out = parseMarkdownTable(text)!;
+    expect(out).not.toBeNull();
+    expect(out.title).toBe('MongoDB Stock Price Evolution (2018-2026)');
+    expect(out.columns).toEqual(['Year', 'Closing Price']);
+    expect(out.rows.length).toBe(9);
+    // Numeric coercion strips $ and , so the picker can see it as a series.
+    expect(out.rows[0]).toEqual({ Year: 2018, 'Closing Price': 83.74 });
+    expect(out.rows[8].Year).toBe('2026 (May)');
+  });
+
+  test('returns null when no table present', () => {
+    expect(parseMarkdownTable('just plain text\nno table here')).toBeNull();
+    expect(parseMarkdownTable('')).toBeNull();
+  });
+
+  test('rejects pseudo-tables without separator row', () => {
+    expect(parseMarkdownTable('| A | B |\n| 1 | 2 |')).toBeNull();
+  });
+
+  test('handles right-aligned and centered separators', () => {
+    const text = '| A | B |\n| ---: | :---: |\n| x | 9 |';
+    const out = parseMarkdownTable(text)!;
+    expect(out.columns).toEqual(['A', 'B']);
+    expect(out.rows[0]).toEqual({ A: 'x', B: 9 });
+  });
+});
+
+// --- Layer 1: shapeSearchTable swaps to markdown table on single hit ---
+
+describe('shapeSearchTable markdown-table swap', () => {
+  test('single result with markdown-table chunk_text is rendered as that table', () => {
+    const result = [{
+      slug: 'mongodb_data',
+      page_id: 1,
+      title: 'MongoDB Stock Price Evolution (2018-2026)',
+      type: 'note',
+      score: 0.3,
+      chunk_text: '# MongoDB Stock Price Evolution\n\n| Year | Price |\n| :--- | :--- |\n| 2024 | $232 |\n| 2025 | $419 |',
+    }];
+    const out = shapePortalPayload('search_table', { query: 'MongoDB' }, result) as Record<string, unknown>;
+    expect(out.columns).toEqual(['Year', 'Price']);
+    expect(out.source_kind).toBe('markdown_table');
+    expect(out.source_slug).toBe('mongodb_data');
+    expect((out.rows as unknown[]).length).toBe(2);
+  });
+
+  test('multi-result query keeps the flat search_table shape', () => {
+    const out = shapePortalPayload('search_table', { query: 'q' }, searchResults(3)) as Record<string, unknown>;
+    expect(out.source_kind).toBeUndefined();
+    expect(out.columns).toEqual(['title', 'slug', 'type', 'score', 'chunk_text']);
+  });
+});
+
+// --- Layer 2: TEMPLATE_CATALOG sanity ---
+
+describe('TEMPLATE_CATALOG', () => {
+  test('templates align with what the portal currently renders', () => {
+    const names = TEMPLATE_CATALOG.map(t => t.template).sort();
+    expect(names).toEqual(['generic_cards', 'jobs_status', 'search_table', 'stats_dashboard', 'timeline_view']);
+  });
+  test('each entry has category + view + description', () => {
+    for (const e of TEMPLATE_CATALOG) {
+      expect(typeof e.category).toBe('string');
+      expect(typeof e.view).toBe('string');
+      expect(e.description.length).toBeGreaterThan(10);
+    }
   });
 });
 

@@ -120,6 +120,8 @@ export function logGenuiBoot(): void {
     ttl_hours: cfg.ttlHours,
     max_payload_bytes: cfg.maxPayloadBytes,
     timeout_ms: cfg.timeoutMs,
+    view_picker_enabled: cfg.viewPickerEnabled,
+    view_picker_model: cfg.viewPickerModel ?? '<gateway-default>',
     debug_log_path: resolveDebugLogPath(),
   });
 }
@@ -162,6 +164,12 @@ export interface GenuiConfig {
   maxPayloadBytes: number;
   /** Total POST timeout (ms). */
   timeoutMs: number;
+  /** Layer 2: opt-in LLM view-picker. Default off. */
+  viewPickerEnabled: boolean;
+  /** Optional model override for the view-picker call (e.g. "anthropic:claude-haiku-4-5"). */
+  viewPickerModel: string | null;
+  /** Total view-picker call timeout (ms). Tight cap so renders stay snappy. */
+  viewPickerTimeoutMs: number;
 }
 
 export interface UiArtifactSummary {
@@ -250,7 +258,13 @@ export function loadGenuiConfig(): GenuiConfig {
   const renderFor = parseRenderFor(env.GENUI_RENDER_FOR);
   const maxPayloadBytes = parseInt10(env.GENUI_MAX_PAYLOAD_BYTES, 250_000);
   const timeoutMs = parseInt10(env.GENUI_TIMEOUT_MS, 2500);
-  return { enabled, mode, baseUrl, apiToken: apiToken || null, ttlHours, renderFor, maxPayloadBytes, timeoutMs };
+  const viewPickerEnabled = parseBool(env.GENUI_VIEW_PICKER, false);
+  const viewPickerModel = env.GENUI_VIEW_PICKER_MODEL?.trim() || null;
+  const viewPickerTimeoutMs = parseInt10(env.GENUI_VIEW_PICKER_TIMEOUT_MS, 3000);
+  return {
+    enabled, mode, baseUrl, apiToken: apiToken || null, ttlHours, renderFor,
+    maxPayloadBytes, timeoutMs, viewPickerEnabled, viewPickerModel, viewPickerTimeoutMs,
+  };
 }
 
 // --- Shape detection ---
@@ -656,14 +670,111 @@ function pickFields<T extends Record<string, unknown>>(row: T, cols: readonly st
   return out;
 }
 
+/**
+ * Parse a markdown table out of arbitrary text. Returns null if no parseable
+ * pipe-style table is found.
+ *
+ * Recognizes:
+ *   | A | B |
+ *   | --- | --- |   (or :--- / ---: alignment markers)
+ *   | x | y |
+ *
+ * Handles a leading `# Heading` or `## Heading` immediately above the table
+ * by returning it as `title`. Coerces numeric-looking cells (with currency
+ * symbols stripped) to numbers when at least 2 cells in a column parse — the
+ * Layer-2 view-picker uses that to decide line vs. bar charts.
+ */
+export function parseMarkdownTable(text: string): { title?: string; columns: string[]; rows: Record<string, unknown>[] } | null {
+  if (typeof text !== 'string' || text.length === 0) return null;
+  const lines = text.split(/\r?\n/);
+  // Find the first 3-row run of pipe-led lines (header / sep / data).
+  for (let i = 0; i < lines.length - 2; i++) {
+    const header = lines[i].trim();
+    const sep = lines[i + 1].trim();
+    if (!header.startsWith('|') || !sep.startsWith('|')) continue;
+    if (!/^\|[\s:|-]+\|$/.test(sep)) continue;
+    const headerCells = splitMdRow(header);
+    const sepCells = splitMdRow(sep);
+    if (headerCells.length < 2 || sepCells.length !== headerCells.length) continue;
+    if (!sepCells.every(c => /^:?-{3,}:?$/.test(c.replace(/\s/g, '')))) continue;
+
+    const columns = headerCells;
+    const rows: Record<string, unknown>[] = [];
+    let j = i + 2;
+    while (j < lines.length && lines[j].trim().startsWith('|')) {
+      const dataCells = splitMdRow(lines[j].trim());
+      if (dataCells.length === columns.length) {
+        const row: Record<string, unknown> = {};
+        for (let c = 0; c < columns.length; c++) {
+          row[columns[c]] = coerceCell(dataCells[c]);
+        }
+        rows.push(row);
+      }
+      j++;
+    }
+    if (rows.length === 0) continue;
+
+    // Look back up to 3 lines for a heading.
+    let title: string | undefined;
+    for (let k = i - 1; k >= Math.max(0, i - 4); k--) {
+      const m = /^\s*#{1,6}\s+(.+?)\s*$/.exec(lines[k]);
+      if (m) { title = m[1]; break; }
+      if (lines[k].trim() !== '') break;
+    }
+
+    return { title, columns, rows };
+  }
+  return null;
+}
+
+function splitMdRow(line: string): string[] {
+  // Strip leading + trailing pipe, then split by unescaped |.
+  const trimmed = line.replace(/^\|/, '').replace(/\|$/, '');
+  return trimmed.split('|').map(s => s.trim());
+}
+
+function coerceCell(raw: string): unknown {
+  if (raw === '') return null;
+  // Strip $ and , and whitespace, try as number.
+  const numeric = raw.replace(/[\s$,]/g, '');
+  if (/^-?\d+(\.\d+)?%?$/.test(numeric)) {
+    const stripped = numeric.replace(/%$/, '');
+    const n = Number(stripped);
+    if (Number.isFinite(n)) return n;
+  }
+  return raw;
+}
+
 function shapeSearchTable(params: Record<string, unknown>, result: unknown): Record<string, unknown> {
   const query = (typeof params.query === 'string' ? params.query : '') ||
                 (typeof params.q === 'string' ? params.q : '');
-  const rows = Array.isArray(result)
-    ? (result as Record<string, unknown>[])
-        .filter(r => isPlainObject(r))
-        .map(r => pickFields(r, SEARCH_TABLE_COLUMNS))
-    : [];
+  const arr = Array.isArray(result) ? result : [];
+
+  // Layer 1: when there's exactly one strong result and its chunk_text contains
+  // a parseable markdown table, serve THAT table as the artifact body. The MCP
+  // result is unchanged; only the portal payload is reshaped, so the agent
+  // still sees the raw search row but the operator sees a clean table.
+  if (arr.length === 1 && isPlainObject(arr[0])) {
+    const top = arr[0] as Record<string, unknown>;
+    const chunkText = typeof top.chunk_text === 'string' ? top.chunk_text : '';
+    const md = parseMarkdownTable(chunkText);
+    if (md && md.rows.length > 0) {
+      return {
+        query,
+        // Title falls back to the page's frontmatter title so the artifact
+        // header is meaningful even when the markdown didn't carry one.
+        title: md.title || (typeof top.title === 'string' ? top.title : ''),
+        columns: md.columns,
+        rows: md.rows,
+        source_slug: typeof top.slug === 'string' ? top.slug : null,
+        source_kind: 'markdown_table',
+      };
+    }
+  }
+
+  const rows = arr
+    .filter(r => isPlainObject(r))
+    .map(r => pickFields(r as Record<string, unknown>, SEARCH_TABLE_COLUMNS));
   return { query, columns: SEARCH_TABLE_COLUMNS, rows };
 }
 
@@ -715,6 +826,203 @@ export function shapePortalPayload(template: string, params: Record<string, unkn
   }
 }
 
+// --- Layer 2: LLM view-picker ---
+//
+// Opt-in. When `GENUI_VIEW_PICKER=true`, after the rule-based picker has
+// chosen a template, ask a cheap LLM (gateway default chat model — typically
+// Haiku 4.5 / Gemini Flash) to confirm or override the choice given a small
+// sample of the actual data. Output is constrained to `TEMPLATE_CATALOG` so
+// the picker can never produce a template the portal doesn't render.
+//
+// Failure modes (return null, falls back to rule-based pick):
+//   - Gateway not configured / no API key (`isAvailable('chat')` false)
+//   - LLM throws / times out
+//   - Output is malformed JSON or names an unknown template
+
+export interface TemplateCatalogEntry {
+  template: string;
+  category: string;
+  view: string;
+  description: string;
+}
+
+/**
+ * Catalog of templates the Hermes portal can render. Keep in sync with the
+ * portal's template registry; sending a template name not in this list will
+ * be 400'd by the portal.
+ *
+ * Future templates expected on the Hermes side (line_chart, bar_chart,
+ * markdown_view, metric_card) get added here once the portal renders them —
+ * the picker will start emitting them as soon as the catalog grows.
+ */
+export const TEMPLATE_CATALOG: TemplateCatalogEntry[] = [
+  {
+    template: 'search_table',
+    category: 'search',
+    view: 'table',
+    description: 'Tabular result list with columns. Default for any list of objects.',
+  },
+  {
+    template: 'stats_dashboard',
+    category: 'stats',
+    view: 'dashboard',
+    description: 'Numeric metric grid. Use when result is an object with multiple numeric fields.',
+  },
+  {
+    template: 'timeline_view',
+    category: 'timeline',
+    view: 'timeline',
+    description: 'Chronological list. Use when items have a date field and a summary.',
+  },
+  {
+    template: 'jobs_status',
+    category: 'jobs',
+    view: 'status',
+    description: 'Job-board layout grouped by status. Use for items with id + status fields.',
+  },
+  {
+    template: 'generic_cards',
+    category: 'graph',
+    view: 'cards',
+    description: 'Card grid. Use for entity/page summaries with title + slug + description.',
+  },
+];
+
+const TEMPLATE_BY_NAME = new Map(TEMPLATE_CATALOG.map(t => [t.template, t]));
+
+/** Truncate the result to a small JSON sample fit for an LLM prompt. */
+function sampleResultForPrompt(result: unknown, maxBytes = 2000): unknown {
+  let serialized = '';
+  try { serialized = JSON.stringify(result); } catch { return null; }
+  if (serialized.length <= maxBytes) return result;
+  // For arrays, keep first few entries. For objects, keep all keys but
+  // truncate string values.
+  if (Array.isArray(result)) {
+    const sample = result.slice(0, 5).map(item => truncateValues(item, 400));
+    return sample;
+  }
+  if (isPlainObject(result)) return truncateValues(result, 400);
+  return String(serialized).slice(0, maxBytes);
+}
+
+function truncateValues(v: unknown, max: number): unknown {
+  if (typeof v === 'string') return v.length > max ? v.slice(0, max) + '…[truncated]' : v;
+  if (Array.isArray(v)) return v.slice(0, 5).map(x => truncateValues(x, max));
+  if (isPlainObject(v)) {
+    const out: Record<string, unknown> = {};
+    for (const [k, val] of Object.entries(v)) out[k] = truncateValues(val, max);
+    return out;
+  }
+  return v;
+}
+
+/** Best-effort JSON parser; tolerates code-fenced output. */
+function parseLooseJson(text: string): Record<string, unknown> | null {
+  if (typeof text !== 'string' || text.trim().length === 0) return null;
+  let body = text.trim();
+  // Strip ```json ... ``` or ``` ... ``` fences.
+  const fenced = /^```(?:json)?\s*\n?([\s\S]*?)\n?```\s*$/i.exec(body);
+  if (fenced) body = fenced[1].trim();
+  // Find first { ... last }.
+  const first = body.indexOf('{');
+  const last = body.lastIndexOf('}');
+  if (first >= 0 && last > first) body = body.slice(first, last + 1);
+  try {
+    const parsed = JSON.parse(body);
+    return isPlainObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+const VIEW_PICKER_SYSTEM = `You pick the best UI template for displaying a JSON result to a human operator.
+
+You must respond with strict JSON of the shape:
+{"template": "<one of the candidate template names>", "reason": "<one short sentence>"}
+
+Choose the template that best matches the data. Prefer specialized templates (timeline_view for date-ordered events, jobs_status for jobs, stats_dashboard for numeric metrics) over the generic search_table when the data fits them. If nothing fits well, fall back to the candidate marked as the current pick. Never invent a template name not in the candidates.`;
+
+interface PickedView {
+  template: string;
+  category: string;
+  view: string;
+  reason?: string;
+}
+
+async function pickViewWithLlm(opts: {
+  operation: string;
+  params: Record<string, unknown>;
+  result: unknown;
+  initialTemplate: string;
+  cfg: GenuiConfig;
+}): Promise<PickedView | null> {
+  try {
+    const gateway = await import('../core/ai/gateway.ts');
+    if (!gateway.isAvailable('chat')) {
+      recordDebug('view_picker', { skipped: true, reason: 'chat_not_available' });
+      return null;
+    }
+    const sample = sampleResultForPrompt(opts.result);
+    const prompt = JSON.stringify({
+      operation: opts.operation,
+      params: redactParamsSummary(opts.operation, opts.params),
+      result_sample: sample,
+      candidate_templates: TEMPLATE_CATALOG.map(t => ({
+        template: t.template,
+        description: t.description,
+      })),
+      current_pick: opts.initialTemplate,
+    });
+
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(new Error('view_picker_timeout')), opts.cfg.viewPickerTimeoutMs);
+    (t as { unref?: () => void } | undefined)?.unref?.();
+    const startedAt = Date.now();
+    let result: { text?: string };
+    try {
+      result = await gateway.chat({
+        ...(opts.cfg.viewPickerModel ? { model: opts.cfg.viewPickerModel } : {}),
+        system: VIEW_PICKER_SYSTEM,
+        messages: [{ role: 'user', content: prompt }],
+        maxTokens: 200,
+        abortSignal: ctrl.signal,
+      });
+    } finally {
+      clearTimeout(t);
+    }
+    const text = result.text ?? '';
+    const parsed = parseLooseJson(text);
+    if (!parsed) {
+      recordDebug('view_picker', { skipped: true, reason: 'parse_failed', latency_ms: Date.now() - startedAt });
+      return null;
+    }
+    const tpl = typeof parsed.template === 'string' ? parsed.template : '';
+    const meta = TEMPLATE_BY_NAME.get(tpl);
+    if (!meta) {
+      recordDebug('view_picker', { skipped: true, reason: 'unknown_template', got: tpl, latency_ms: Date.now() - startedAt });
+      return null;
+    }
+    const picked: PickedView = {
+      template: meta.template,
+      category: meta.category,
+      view: meta.view,
+      reason: typeof parsed.reason === 'string' ? parsed.reason.slice(0, 200) : undefined,
+    };
+    recordDebug('view_picker', {
+      from: opts.initialTemplate,
+      to: picked.template,
+      changed: picked.template !== opts.initialTemplate,
+      reason: picked.reason,
+      latency_ms: Date.now() - startedAt,
+    });
+    return picked;
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    recordDebug('view_picker', { skipped: true, reason: 'exception', message: msg });
+    return null;
+  }
+}
+
 // --- Public entry point ---
 
 export async function maybeRenderUi(input: MaybeRenderUiInput): Promise<UiArtifactSummary | null> {
@@ -748,6 +1056,23 @@ export async function maybeRenderUi(input: MaybeRenderUiInput): Promise<UiArtifa
     decision.reasons.push('no_base_url');
     log('skipped');
     return null;
+  }
+
+  // Layer 2: optionally let an LLM upgrade the template choice from the
+  // catalog. Pure additive — failure → keep the rule-based pick.
+  if (cfg.viewPickerEnabled && decision.template) {
+    const picked = await pickViewWithLlm({
+      operation,
+      params: input.params,
+      result: input.result,
+      initialTemplate: decision.template,
+      cfg,
+    });
+    if (picked) {
+      decision.template = picked.template;
+      decision.category = picked.category;
+      decision.view = picked.view;
+    }
   }
 
   const title = deriveTitle(operation, input.params, decision.override);
